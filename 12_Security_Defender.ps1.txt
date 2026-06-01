@@ -1,0 +1,119 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS  Section 12 — Security & Microsoft Defender Tuning
+.NOTES
+    Log : C:\VDI_GPO_Logs\12_Security_Defender.log
+    Configures mandatory Defender exclusions for FSLogix, Teams, OneDrive,
+    Horizon, and DEM. Disables SMBv1. Creates Horizon + Teams firewall rules.
+    Run As : Local Administrator / SYSTEM during image build
+    CRITICAL: AV scanning through FSLogix redirector WILL cause logon failures.
+#>
+
+. "$PSScriptRoot\Shared_Helpers.ps1"
+Confirm-Prerequisites
+Initialize-Log "12_Security_Defender"
+
+$errors = 0; $warns = 0; $skipped = 0
+
+Write-Log "=== Configuring Security and Defender tuning ===" "INFO"
+
+# ── 1. Defender path exclusions ───────────────────────────────────────────────
+Write-Log "--- 1. Configure Defender path exclusions" "INFO"
+$excludePaths = @(
+    # FSLogix
+    "C:\Program Files\FSLogix\Apps",
+    "C:\ProgramData\FSLogix",
+    # Horizon Agent
+    "C:\Program Files\VMware\VMware View\Agent",
+    "C:\ProgramData\VMware",
+    # DEM
+    "C:\Program Files\Immidio",          # DEM install path (adjust if custom)
+    "C:\ProgramData\Immidio",
+    # OneDrive
+    "%LocalAppData%\Microsoft\OneDrive",
+    # Teams
+    "%LocalAppData%\Packages\MSTeams_8wekyb3d8bbwe",
+    "%LocalAppData%\Microsoft\Teams",    # legacy Teams path
+)
+foreach ($ep in $excludePaths) {
+    try {
+        Add-MpPreference -ExclusionPath $ep -ErrorAction Stop
+        Write-Log "Defender path exclusion: $ep" "SUCCESS"
+    } catch {
+        Write-Log "FAILED Defender path exclusion $ep : $_" "WARN"; $warns++
+    }
+}
+
+# ── 2. Defender process exclusions ────────────────────────────────────────────
+Write-Log "--- 2. Configure Defender process exclusions" "INFO"
+$excludeProcs = @(
+    "frxsvc.exe",      # FSLogix service
+    "frxdrvvt.exe",    # FSLogix virtual disk driver
+    "frxccds.exe",     # FSLogix cloud cache daemon
+    "frxrender.exe",   # FSLogix rendering
+    "OneDrive.exe",    # OneDrive sync
+    "ms-teams.exe",    # New Teams
+    "Teams.exe",       # Legacy Teams fallback
+)
+foreach ($ep in $excludeProcs) {
+    try {
+        Add-MpPreference -ExclusionProcess $ep -ErrorAction Stop
+        Write-Log "Defender process exclusion: $ep" "SUCCESS"
+    } catch {
+        Write-Log "FAILED Defender process exclusion $ep : $_" "WARN"; $warns++
+    }
+}
+
+# ── 3. Disable SMBv1 ─────────────────────────────────────────────────────────
+Write-Log "--- 3. Disable SMBv1 server and client" "INFO"
+try {
+    Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop
+    Write-Log "SMBv1 Server disabled." "SUCCESS"
+} catch { Write-Log "SMBv1 Server disable failed: $_" "WARN"; $warns++ }
+try {
+    Set-SmbClientConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop
+    Write-Log "SMBv1 Client disabled." "SUCCESS"
+} catch { Write-Log "SMBv1 Client disable failed: $_" "WARN"; $warns++ }
+try {
+    Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction Stop | Out-Null
+    Write-Log "SMB1Protocol feature removed from image." "SUCCESS"
+} catch { Write-Log "SMB1Protocol feature removal: $_" "INFO" }
+
+# ── 4. Disable Remote Registry service ───────────────────────────────────────
+Write-Log "--- 4. Disable Remote Registry service" "INFO"
+if (-not (Set-ServiceConfig -Name "RemoteRegistry" -StartupType Disabled -StopNow $true)) { $warns++ }
+
+# ── 5. Horizon firewall rules ────────────────────────────────────────────────
+Write-Log "--- 5. Create Horizon protocol firewall rules" "INFO"
+$horizonRules = @(
+    @{ Name="VDI-Horizon-PCoIP-TCP-4172";  Proto="TCP"; Port="4172"; Dir="Inbound"  },
+    @{ Name="VDI-Horizon-PCoIP-UDP-4172";  Proto="UDP"; Port="4172"; Dir="Inbound"  },
+    @{ Name="VDI-Horizon-Blast-TCP-443";   Proto="TCP"; Port="443";  Dir="Inbound"  },
+    @{ Name="VDI-Horizon-Blast-TCP-8443";  Proto="TCP"; Port="8443"; Dir="Inbound"  },
+    @{ Name="VDI-Horizon-Blast-UDP-8443";  Proto="UDP"; Port="8443"; Dir="Inbound"  },
+    @{ Name="VDI-Horizon-USB-TCP-32111";   Proto="TCP"; Port="32111";Dir="Inbound"  },
+    @{ Name="VDI-Horizon-MMR-TCP-9427";    Proto="TCP"; Port="9427"; Dir="Inbound"  },
+)
+foreach ($r in $horizonRules) {
+    if (-not (Add-FirewallRule -DisplayName $r.Name -Protocol $r.Proto -LocalPort $r.Port -Direction $r.Dir)) {
+        $warns++
+    }
+}
+
+# ── 6. Teams media optimization firewall rules (NEW) ─────────────────────────
+Write-Log "--- 6. Create Teams VDI media optimization firewall rules (NEW)" "INFO"
+$teamsRules = @(
+    @{ Name="VDI-Teams-STUN-UDP-3478"; Proto="UDP"; Port="3478"; Dir="Inbound" },
+    @{ Name="VDI-Teams-STUN-UDP-3479"; Proto="UDP"; Port="3479"; Dir="Inbound" },
+    @{ Name="VDI-Teams-STUN-UDP-3480"; Proto="UDP"; Port="3480"; Dir="Inbound" },
+    @{ Name="VDI-Teams-STUN-UDP-3481"; Proto="UDP"; Port="3481"; Dir="Inbound" },
+)
+foreach ($r in $teamsRules) {
+    if (-not (Add-FirewallRule -DisplayName $r.Name -Protocol $r.Proto -LocalPort $r.Port -Direction $r.Dir)) {
+        $warns++
+    }
+}
+
+Write-Log "=== Section 12 complete ===" "INFO"
+Write-Log "REMINDER: Also configure AV exclusions in any third-party AV deployed alongside Defender." "WARN"
+Close-Log -Errors $errors -Warnings $warns -Skipped $skipped

@@ -1,0 +1,113 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS  Section 03 — Microsoft Teams (Machine-Wide Install + Outlook Add-In)
+.NOTES
+    Log : C:\VDI_GPO_Logs\03_Microsoft_Teams.log
+    Teams must be installed BEFORE running this script (ALLUSERS=1 MSI).
+    Covers: auto-update disable, tenant restriction, add-in enforcement,
+            consumer Chat icon, Teams VDI firewall ports.
+    Run As : Local Administrator / SYSTEM during image build
+#>
+
+. "$PSScriptRoot\Shared_Helpers.ps1"
+Confirm-Prerequisites
+Initialize-Log "03_Microsoft_Teams"
+
+$errors = 0; $warns = 0; $skipped = 0
+
+Write-Log "=== Configuring Microsoft Teams VDI policies ===" "INFO"
+
+# ── 1. Disable Teams auto-update ──────────────────────────────────────────────
+Write-Log "--- 1. Disable Teams auto-update" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\Microsoft\MicrosoftTeams" `
+    -Name "DisableAutoUpdate" -Value 1)) { $errors++ }
+
+# ── 2. Suppress Teams first-launch splash ─────────────────────────────────────
+Write-Log "--- 2. Suppress Teams first-launch splash" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\Microsoft\MicrosoftTeams" `
+    -Name "PreventFirstLaunchAfterInstall" -Value 1)) { $errors++ }
+
+# ── 3. Restrict Teams sign-in to corporate tenant ─────────────────────────────
+Write-Log "--- 3. Restrict Teams sign-in to corporate Entra ID tenant" "INFO"
+$tenantGuid = "YOUR-TENANT-GUID-HERE"   # <-- Replace with your Entra Tenant ID
+if ($tenantGuid -eq "YOUR-TENANT-GUID-HERE") {
+    Write-Log "WARNING: TenantGUID not configured. Edit line with YOUR-TENANT-GUID-HERE" "WARN"
+    $warns++
+} else {
+    if (-not (Set-RegValue -Hive HKLM `
+        -Path "SOFTWARE\Policies\Microsoft\MicrosoftTeams" `
+        -Name "RestrictTeamsSignInToAccountsFromTenantList" `
+        -Value $tenantGuid -Type String)) { $errors++ }
+}
+
+# ── 4. Disable consumer Teams/Chat Taskbar icon ───────────────────────────────
+Write-Log "--- 4. Disable consumer Teams Chat Taskbar icon (ChatIcon = 3)" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\Microsoft\Windows\Windows Chat" `
+    -Name "ChatIcon" -Value 3)) { $errors++ }
+
+# ── 5. Teams Outlook add-in — enforce LoadBehavior = 3 (auto-load) ────────────
+Write-Log "--- 5. Enforce Teams Outlook add-in (machine-level LoadBehavior)" "INFO"
+$addInPath = "SOFTWARE\Microsoft\Office\Outlook\Addins\TeamsAddin.FastConnect"
+if (Test-Path "HKLM:\$addInPath") {
+    if (-not (Set-RegValue -Hive HKLM -Path $addInPath -Name "LoadBehavior" -Value 3)) { $errors++ }
+    if (-not (Set-RegValue -Hive HKLM -Path $addInPath `
+        -Name "FriendlyName" -Value "Microsoft Teams Meeting Add-in for Microsoft Office" `
+        -Type String)) { $errors++ }
+} else {
+    Write-Log "Teams add-in registry key not found at HKLM:\$addInPath" "WARN"
+    Write-Log "This is expected if Teams was not yet installed. Re-run after machine-wide Teams install." "WARN"
+    $warns++
+}
+
+# ── 6. Prevent users from disabling Teams add-in (Managed Add-ins policy) ─────
+Write-Log "--- 6. Set Teams add-in as managed (users cannot disable)" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\Microsoft\Office\16.0\Outlook\Resiliency\AddinList" `
+    -Name "TeamsAddin.FastConnect" -Value 1)) { $errors++ }
+
+# ── 7. Teams — disable auto-start from HKLM Run key ──────────────────────────
+Write-Log "--- 7. Remove Teams from HKLM Run key (manage startup via DEM/Task Scheduler)" "INFO"
+$runPath = "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+try {
+    $runProps = Get-ItemProperty -Path "HKLM:\$runPath" -ErrorAction SilentlyContinue
+    $found = $false
+    foreach ($prop in $runProps.PSObject.Properties) {
+        if ($prop.Name -notlike "PS*" -and $prop.Value -match "(?i)teams") {
+            Remove-RegValue -Hive HKLM -Path $runPath -Name $prop.Name
+            $found = $true
+        }
+    }
+    if (-not $found) { Write-Log "No Teams Run key entry found in HKLM — already clean" "SKIP"; $skipped++ }
+} catch {
+    Write-Log "Could not enumerate HKLM Run key: $_" "WARN"; $warns++
+}
+
+# ── 8. Configure Teams diagnostic data (align with org policy) ────────────────
+Write-Log "--- 8. Set Teams diagnostic data level (Required = 1)" "INFO"
+# 0=Neither, 1=Required, 2=Optional
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\Microsoft\MicrosoftTeams" `
+    -Name "MSTeamsDisableDiagnosticData" -Value 0)) { $errors++ }
+
+# ── 9. Firewall rules for Teams media optimization (Omnissa Horizon offload) ───
+Write-Log "--- 9. Create firewall rules for Teams VDI media optimization ports" "INFO"
+$fwRules = @(
+    @{ Name="VDI-Teams-Media-UDP-3478";   Proto="UDP"; Port="3478"; Dir="Inbound" },
+    @{ Name="VDI-Teams-Media-UDP-3479";   Proto="UDP"; Port="3479"; Dir="Inbound" },
+    @{ Name="VDI-Teams-Media-UDP-3480";   Proto="UDP"; Port="3480"; Dir="Inbound" },
+    @{ Name="VDI-Teams-Media-UDP-3481";   Proto="UDP"; Port="3481"; Dir="Inbound" },
+    @{ Name="VDI-Teams-Signaling-TCP-443";Proto="TCP"; Port="443";  Dir="Inbound" },
+)
+foreach ($r in $fwRules) {
+    if (-not (Add-FirewallRule -DisplayName $r.Name -Protocol $r.Proto -LocalPort $r.Port -Direction $r.Dir)) {
+        $warns++
+    }
+}
+
+Write-Log "=== Section 03 complete ===" "INFO"
+Write-Log "REMINDER: Ensure Omnissa Virtualization Pack for Teams is installed on golden image." "WARN"
+Write-Log "REMINDER: Replace YOUR-TENANT-GUID-HERE with your actual Entra Tenant ID." "WARN"
+Close-Log -Errors $errors -Warnings $warns -Skipped $skipped

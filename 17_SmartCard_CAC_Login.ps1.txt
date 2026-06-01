@@ -1,0 +1,455 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS  Section 17 — Smart Card / CAC Seamless Login
+           Omnissa Horizon VDI — USAF / DoD Environment
+
+.DESCRIPTION
+    Configures seamless CAC/PIV authentication for non-persistent Horizon VDI.
+    Covers:
+      - Smart Card services (SCardSvr, ScDeviceEnum, CertPropSvc)
+      - Credential provider ordering — Smart Card first, Horizon True SSO present
+      - STIG-compliant DisableCAD = 0 (Ctrl+Alt+Delete required by STIG V-220726)
+      - Seamless login path via Horizon True SSO (bypasses Ctrl+Alt+Delete prompt)
+      - DefaultCredentialProvider set to Smart Card CLSID
+      - Disable non-CAC credential providers (PIN, password — commented, evaluate)
+      - Smart card removal behavior (lock workstation)
+      - DoD PKI root certificate verification (InstallRoot check)
+      - ActivClient detection and middleware validation
+      - Interactive logon policies for smart card
+      - NTAuth store verification
+      - Credential provider filter for True SSO pass-through
+      - USB smart card reader — ensure not power-gated
+
+    TRUE SSO NOTE:
+      Seamless login (no Ctrl+Alt+Delete, no Windows credential prompt) requires
+      Horizon True SSO. This is a Horizon Connection Server / Enrollment Server
+      feature — separate from Entra ID / HAADJ. The user presents their CAC to
+      the Horizon broker; True SSO issues a short-lived cert; Windows logs in via
+      certificate silently. Without True SSO the user will see the Windows logon
+      screen but the CAC should auto-populate — no password entry required.
+
+    STIG REFERENCE:
+      V-220726 — Interactive logon: Do not require Ctrl+Alt+Delete = Disabled
+      V-220712 — Smart card removal behavior
+      V-220713 — Interactive logon: Require smart card (evaluate per org)
+
+.NOTES
+    Log     : C:\VDI_GPO_Logs\17_SmartCard_CAC_Login.log
+    Run As  : Local Administrator / SYSTEM during golden image build
+    Requires: ActivClient installed before this script runs
+              DoD InstallRoot run before this script runs
+#>
+
+. "$PSScriptRoot\Shared_Helpers.ps1"
+Confirm-Prerequisites
+Initialize-Log "17_SmartCard_CAC_Login"
+
+$errors = 0; $warns = 0; $skipped = 0
+
+# ── CREDENTIAL PROVIDER CLSIDs ─────────────────────────────────────────────────
+$CP_SMARTCARD   = "{8FD7E19C-3BF7-489B-A72C-846AB3678C96}"   # Smart Card CP
+$CP_SCPIN       = "{94596C7E-3744-41CE-893E-BBF09122F76A}"   # Smart Card PIN CP
+$CP_PASSWORD    = "{6F45DC1E-5384-457A-BC13-2CD81B0D28ED}"   # Password CP
+$CP_WINHELLO    = "{D6886603-9D2F-4EB2-B667-1971041FA96B}"   # Windows Hello PIN
+$CP_HORIZON_SSO = "{DEE0BE65-3A4D-4D41-9F28-09EA9F309EA7}"   # Horizon True SSO
+$CP_BASE        = "SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers"
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+$requireSmartCard    = $true    # STIG V-220713: require smart card for logon
+$scRemovalBehavior   = 1        # 0=No action, 1=Lock workstation, 2=Force logoff, 3=Disconnect
+$disableWinHello     = $true    # Disable Windows Hello PIN (no PIN logon in CAC env)
+$disablePasswordCP   = $false   # Set $true to hide password credential provider
+                                # CAUTION: ensure recovery method exists before enabling
+# ─────────────────────────────────────────────────────────────────────────────
+
+Write-Log "=== Configuring CAC / Smart Card seamless login ===" "INFO"
+Write-Log "Environment: USAF / area52.afnoapps.usaf.mil" "INFO"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. SMART CARD SERVICES
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "--- 1. Smart Card services" "INFO"
+
+$scServices = @(
+    @{ Name="SCardSvr";      Display="Smart Card";                          Type="Automatic" },
+    @{ Name="ScDeviceEnum";  Display="Smart Card Device Enumeration";       Type="Automatic" },
+    @{ Name="CertPropSvc";   Display="Certificate Propagation";             Type="Automatic" },
+    @{ Name="SCPolicySvc";   Display="Smart Card Removal Policy";           Type="Automatic" },
+)
+
+foreach ($svc in $scServices) {
+    $s = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+    if ($s) {
+        if (-not (Set-ServiceConfig -Name $svc.Name -StartupType $svc.Type)) { $errors++ }
+        try {
+            Start-Service -Name $svc.Name -ErrorAction Stop
+            Write-Log "Service started: $($svc.Display)" "SUCCESS"
+        } catch {
+            Write-Log "Service $($svc.Display) could not be started now (expected if no reader attached): $_" "INFO"
+        }
+    } else {
+        Write-Log "Service NOT found: $($svc.Display) ($($svc.Name)) — verify Windows install integrity." "WARN"
+        $warns++
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. CTRL+ALT+DELETE — STIG COMPLIANT (DisableCAD = 0)
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "--- 2. DisableCAD = 0 (STIG V-220726 requires Ctrl+Alt+Delete)" "INFO"
+Write-Log "    Seamless login is achieved via Horizon True SSO, NOT by removing Ctrl+Alt+Delete." "INFO"
+
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" `
+    -Name "DisableCAD" -Value 0)) { $errors++ }
+
+# Also enforce via policy key
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon" `
+    -Name "DisableCAD" -Value 0)) { $errors++ }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. CREDENTIAL PROVIDERS — SMART CARD FIRST, TRUE SSO PRESENT
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "--- 3. Credential Provider configuration" "INFO"
+
+# 3a. Smart Card credential provider — ensure ENABLED
+Write-Log "  3a. Enable Smart Card credential provider" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "$CP_BASE\$CP_SMARTCARD" `
+    -Name "Disabled" -Value 0)) { $errors++ }
+
+# 3b. Smart Card PIN credential provider — ensure ENABLED
+Write-Log "  3b. Enable Smart Card PIN credential provider" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "$CP_BASE\$CP_SCPIN" `
+    -Name "Disabled" -Value 0)) { $errors++ }
+
+# 3c. Set Smart Card as DefaultCredentialProvider
+Write-Log "  3c. Set Smart Card as DefaultCredentialProvider" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\Microsoft\Windows\System" `
+    -Name "DefaultCredentialProvider" `
+    -Value $CP_SMARTCARD -Type String)) { $errors++ }
+
+# 3d. Horizon True SSO credential provider — check present and enabled
+Write-Log "  3d. Checking Horizon True SSO credential provider" "INFO"
+$tssoKey = "HKLM:\$CP_BASE\$CP_HORIZON_SSO"
+if (Test-Path $tssoKey) {
+    $tssoDisabled = (Get-ItemProperty $tssoKey -ErrorAction SilentlyContinue).Disabled
+    if ($tssoDisabled -ne 0) {
+        if (-not (Set-RegValue -Hive HKLM `
+            -Path "$CP_BASE\$CP_HORIZON_SSO" `
+            -Name "Disabled" -Value 0)) { $errors++ }
+    } else {
+        Write-Log "Horizon True SSO credential provider present and enabled." "SUCCESS"
+        $skipped++
+    }
+} else {
+    Write-Log "Horizon True SSO credential provider NOT FOUND at $tssoKey" "WARN"
+    Write-Log "True SSO will not function. Verify Horizon Agent version and True SSO installation on Connection Server." "WARN"
+    $warns++
+}
+
+# 3e. Disable Windows Hello PIN (no PIN logon in CAC environment)
+Write-Log "  3e. Windows Hello PIN credential provider" "INFO"
+if ($disableWinHello) {
+    if (-not (Set-RegValue -Hive HKLM `
+        -Path "$CP_BASE\$CP_WINHELLO" `
+        -Name "Disabled" -Value 1)) { $warns++ }
+    # Also disable via policy
+    if (-not (Set-RegValue -Hive HKLM `
+        -Path "SOFTWARE\Policies\Microsoft\PassportForWork" `
+        -Name "Enabled" -Value 0)) { $warns++ }
+    Write-Log "Windows Hello PIN disabled." "SUCCESS"
+} else {
+    Write-Log "SKIP: Windows Hello PIN not disabled (disableWinHello = false)" "SKIP"
+    $skipped++
+}
+
+# 3f. Optionally disable password credential provider
+Write-Log "  3f. Password credential provider" "INFO"
+if ($disablePasswordCP) {
+    Write-Log "Disabling Password credential provider (disablePasswordCP = true)" "WARN"
+    Write-Log "CAUTION: Ensure a recovery path exists before deploying to production." "WARN"
+    $warns++
+    if (-not (Set-RegValue -Hive HKLM `
+        -Path "$CP_BASE\$CP_PASSWORD" `
+        -Name "Disabled" -Value 1)) { $errors++ }
+} else {
+    Write-Log "Password credential provider left enabled. Set disablePasswordCP=true to restrict." "SKIP"
+    $skipped++
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. INTERACTIVE LOGON POLICIES
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "--- 4. Interactive logon policies" "INFO"
+
+# 4a. Require Smart Card for logon (STIG V-220713)
+Write-Log "  4a. Interactive logon: Require smart card" "INFO"
+if ($requireSmartCard) {
+    if (-not (Set-RegValue -Hive HKLM `
+        -Path "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" `
+        -Name "ScForceOption" -Value 1)) { $errors++ }
+    # Policy key
+    if (-not (Set-RegValue -Hive HKLM `
+        -Path "SOFTWARE\Policies\Microsoft\Windows\System" `
+        -Name "ScForceOption" -Value 1)) { $errors++ }
+} else {
+    Write-Log "SKIP: Smart card not enforced (requireSmartCard = false)" "SKIP"
+    $skipped++
+}
+
+# 4b. Smart Card removal behavior — Lock workstation (STIG V-220712)
+Write-Log "  4b. Smart card removal behavior = $scRemovalBehavior (1=Lock)" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" `
+    -Name "SCRemoveOption" `
+    -Value "$scRemovalBehavior" -Type String)) { $errors++ }
+# Policy key
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon" `
+    -Name "SCRemoveOption" `
+    -Value "$scRemovalBehavior" -Type String)) { $errors++ }
+
+# 4c. Disable cached credentials (smart card environments — no cached logon)
+Write-Log "  4c. Disable cached credentials (smart card environments)" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" `
+    -Name "CachedLogonsCount" `
+    -Value "0" -Type String)) { $errors++ }
+
+# 4d. Do not display last signed-in username
+Write-Log "  4d. Do not display last signed-in user name" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" `
+    -Name "DontDisplayLastUserName" -Value 1)) { $errors++ }
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\Microsoft\Windows\System" `
+    -Name "DontDisplayLastUserName" -Value 1)) { $errors++ }
+
+# 4e. Do not display username at sign-in (shows only PIN/cert prompt)
+Write-Log "  4e. Do not enumerate local users on logon screen" "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\Microsoft\Windows\System" `
+    -Name "BlockDomainPicturePassword" -Value 1)) { $errors++ }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. DOD PKI — INSTALLROOT AND CERTIFICATE STORE VERIFICATION
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "--- 5. DoD PKI certificate store verification" "INFO"
+
+# 5a. Check DoD Root CAs in Trusted Root store
+$dodRoots = Get-ChildItem Cert:\LocalMachine\Root -ErrorAction SilentlyContinue |
+    Where-Object { $_.Subject -match "DoD" -or $_.Subject -match "Defense" }
+$dodRootCount = ($dodRoots | Measure-Object).Count
+
+if ($dodRootCount -gt 0) {
+    Write-Log "DoD Root CAs found in Trusted Root store: $dodRootCount certificate(s)" "SUCCESS"
+    $dodRoots | ForEach-Object {
+        Write-Log "  Root: $($_.Subject) | Expires: $($_.NotAfter.ToString('yyyy-MM-dd'))" "INFO"
+        if ($_.NotAfter -lt (Get-Date).AddDays(90)) {
+            Write-Log "  WARNING: Certificate expires within 90 days — renew DoD roots." "WARN"
+            $warns++
+        }
+    }
+} else {
+    Write-Log "DoD Root CAs NOT FOUND in Trusted Root store." "FAIL"
+    Write-Log "Run InstallRoot (DISA tool) during image build before sealing." "FAIL"
+    Write-Log "Download: https://dl.dod.cyber.mil — Search: InstallRoot" "INFO"
+    $errors++
+}
+
+# 5b. Check DoD Intermediate / Issuing CAs
+$dodIntermediate = Get-ChildItem Cert:\LocalMachine\CA -ErrorAction SilentlyContinue |
+    Where-Object { $_.Subject -match "DoD" -or $_.Subject -match "Defense" }
+$dodIntCount = ($dodIntermediate | Measure-Object).Count
+
+if ($dodIntCount -gt 0) {
+    Write-Log "DoD Intermediate CAs in store: $dodIntCount certificate(s)" "SUCCESS"
+} else {
+    Write-Log "DoD Intermediate CAs NOT FOUND — CAC certificate chain will fail validation." "FAIL"
+    $errors++
+}
+
+# 5c. Check NTAuth store for DoD certs (required for smart card logon)
+Write-Log "  5c. NTAuth store check (required for smart card domain logon)" "INFO"
+try {
+    $ntauth = certutil -enterprise -store NTAuth 2>&1 | Out-String
+    if ($ntauth -match "DoD" -or $ntauth -match "Defense") {
+        Write-Log "NTAuth store contains DoD certificates — smart card domain logon should work." "SUCCESS"
+    } else {
+        Write-Log "NTAuth store does not appear to contain DoD certificates." "WARN"
+        Write-Log "If smart card logon fails with 'certificate is not trusted', run:" "WARN"
+        Write-Log "  certutil -enterprise -addstore NTAuth <DoD-CA-cert.cer>" "WARN"
+        $warns++
+    }
+} catch {
+    Write-Log "Could not check NTAuth store: $_" "WARN"; $warns++
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. ACTIVCLIENT MIDDLEWARE VALIDATION
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "--- 6. ActivClient middleware validation" "INFO"
+
+# Check multiple possible ActivClient registry locations
+$acPaths = @(
+    "HKLM:\SOFTWARE\HID Global\ActivClient",
+    "HKLM:\SOFTWARE\ActivIdentity\ActivClient",
+    "HKLM:\SOFTWARE\WOW6432Node\HID Global\ActivClient",
+    "HKLM:\SOFTWARE\WOW6432Node\ActivIdentity\ActivClient",
+)
+$acFound = $false
+foreach ($acPath in $acPaths) {
+    if (Test-Path $acPath) {
+        $acVer = (Get-ItemProperty $acPath -ErrorAction SilentlyContinue).Version
+        Write-Log "ActivClient found at: $acPath" "SUCCESS"
+        Write-Log "ActivClient version : $acVer" "INFO"
+        $acFound = $true
+
+        # Verify version compatibility with Windows 11 24H2 (requires 10.x+)
+        if ($acVer -and [version]$acVer -lt [version]"10.0") {
+            Write-Log "ActivClient version $acVer may not be compatible with Windows 11 24H2. Version 10.x required." "WARN"
+            $warns++
+        } else {
+            Write-Log "ActivClient version $acVer is compatible." "SUCCESS"
+        }
+        break
+    }
+}
+if (-not $acFound) {
+    Write-Log "ActivClient NOT found in registry." "FAIL"
+    Write-Log "ActivClient (HID Global) must be installed on the golden image for DoD CAC support." "FAIL"
+    Write-Log "Obtain approved version from your PKE/PKI team or DISA." "INFO"
+    $errors++
+}
+
+# Check ActivClient services
+$acServices = @("ActivClient", "ACSmartCard", "AC.SharedStore")
+foreach ($svcName in $acServices) {
+    $s = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    if ($s) {
+        Write-Log "ActivClient service: $svcName — Status: $($s.Status) StartType: $($s.StartType)" "SUCCESS"
+        if ($s.Status -ne "Running") {
+            try { Start-Service $svcName -ErrorAction Stop; Write-Log "Started $svcName" "SUCCESS" }
+            catch { Write-Log "Could not start ${svcName}: $_" "WARN"; $warns++ }
+        }
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. HORIZON TRUE SSO — CONFIGURATION CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "--- 7. Horizon True SSO configuration check" "INFO"
+
+# 7a. Check True SSO credential provider filter
+$cpFilterPath = "HKLM:\SOFTWARE\VMware, Inc.\VMware VDM\Plugins\wssm\CredentialFilter"
+if (Test-Path $cpFilterPath) {
+    Write-Log "Horizon credential filter registry key found." "SUCCESS"
+    $filter = Get-ItemProperty $cpFilterPath -ErrorAction SilentlyContinue
+    Write-Log "Filter config: $($filter | Out-String)" "INFO"
+} else {
+    Write-Log "Horizon credential filter path not found. Verify Horizon Agent is installed." "WARN"
+    $warns++
+}
+
+# 7b. Check VMware View Agent service
+$vdmAgent = Get-Service -Name "vmware-viewagent" -ErrorAction SilentlyContinue
+if ($vdmAgent) {
+    Write-Log "Horizon View Agent service: $($vdmAgent.Status) / $($vdmAgent.StartType)" "SUCCESS"
+} else {
+    Write-Log "Horizon View Agent service NOT found — install Horizon Agent before running this script." "FAIL"
+    $errors++
+}
+
+# 7c. Enable Horizon smart card redirection via registry
+Write-Log "  7c. Confirm Horizon smart card redirection enabled" "INFO"
+$horizonSCPath = "HKLM:\SOFTWARE\Policies\VMware, Inc.\VMware VDM\Agent\USB"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\Policies\VMware, Inc.\VMware VDM\Agent" `
+    -Name "AllowSmartCard" -Value $true -Type String)) { $warns++ }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. USB SMART CARD READER — POWER MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "--- 8. USB power management for smart card readers" "INFO"
+
+# USB Selective suspend already handled in Section 14 but enforce explicitly here
+$usbSubGroup = "2a737441-1930-4402-8d77-b2bebba308a3"
+$usbSetting  = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
+try {
+    & powercfg /setacvalueindex SCHEME_CURRENT $usbSubGroup $usbSetting 0 2>&1 | Out-Null
+    & powercfg /setactive SCHEME_CURRENT 2>&1 | Out-Null
+    Write-Log "USB selective suspend disabled (CAC reader dropout prevention)." "SUCCESS"
+} catch {
+    Write-Log "USB suspend config failed: $_" "WARN"; $warns++
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. SCHANNEL — CLIENT CERTIFICATE AUTHENTICATION SUPPORT
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "--- 9. Schannel client authentication configuration" "INFO"
+
+# Enable client certificate authentication
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL" `
+    -Name "ClientAuthTrustMode" -Value 2)) { $warns++ }
+
+# Ensure TLS 1.2 client side enabled (required for M365 / Entra ID)
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Client" `
+    -Name "Enabled" -Value 1)) { $warns++ }
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Client" `
+    -Name "DisabledByDefault" -Value 0)) { $warns++ }
+
+# Disable TLS 1.0 and 1.1 (STIG requirement)
+foreach ($ver in @("TLS 1.0", "TLS 1.1")) {
+    if (-not (Set-RegValue -Hive HKLM `
+        -Path "SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$ver\Client" `
+        -Name "Enabled" -Value 0)) { $warns++ }
+    if (-not (Set-RegValue -Hive HKLM `
+        -Path "SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$ver\Client" `
+        -Name "DisabledByDefault" -Value 1)) { $warns++ }
+}
+Write-Log "Schannel: TLS 1.2 enabled, TLS 1.0/1.1 disabled." "SUCCESS"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 10. SUMMARY OUTPUT AND REMEDIATION GUIDANCE
+# ══════════════════════════════════════════════════════════════════════════════
+Write-Log "=== Section 17 complete ===" "INFO"
+
+if ($errors -gt 0) {
+    Write-Log "CRITICAL ITEMS REQUIRE ATTENTION BEFORE SEALING IMAGE:" "WARN"
+    if (-not $acFound) {
+        Write-Log "  [!] Install ActivClient (HID Global) 10.x before sealing." "WARN"
+    }
+    if ($dodRootCount -eq 0) {
+        Write-Log "  [!] Run DISA InstallRoot to populate DoD PKI certificates." "WARN"
+        Write-Log "      Add to build step 6 in weekly image build sequence." "WARN"
+    }
+    if (-not (Test-Path "HKLM:\$CP_BASE\$CP_HORIZON_SSO")) {
+        Write-Log "  [!] Horizon True SSO credential provider missing." "WARN"
+        Write-Log "      Verify Horizon Agent version and True SSO config on Connection Server." "WARN"
+    }
+}
+
+Write-Log "" "INFO"
+Write-Log "SEAMLESS CAC LOGIN FLOW (when all components are correct):" "INFO"
+Write-Log "  1. User connects via Horizon client — presents CAC to Connection Server" "INFO"
+Write-Log "  2. Connection Server authenticates via PKI / smart card auth" "INFO"
+Write-Log "  3. Horizon True SSO enrollment server issues short-lived Windows logon cert" "INFO"
+Write-Log "  4. Horizon passes cert to VDI session — Windows logs in via certificate" "INFO"
+Write-Log "  5. User lands on desktop with no Ctrl+Alt+Delete, no PIN prompt" "INFO"
+Write-Log "  6. PRT acquired via HAADJ device cert — Teams/OneDrive/Outlook sign in silently" "INFO"
+Write-Log "" "INFO"
+Write-Log "IF TRUE SSO IS NOT CONFIGURED — fallback flow:" "INFO"
+Write-Log "  1. User connects via Horizon client — CAC authenticates to broker" "INFO"
+Write-Log "  2. VDI session presents Windows logon screen" "INFO"
+Write-Log "  3. User presses Ctrl+Alt+Delete (STIG requirement)" "INFO"
+Write-Log "  4. Smart Card credential provider shown first — user enters PIN" "INFO"
+Write-Log "  5. Windows authenticates via CAC certificate to on-prem AD" "INFO"
+
+Close-Log -Errors $errors -Warnings $warns -Skipped $skipped

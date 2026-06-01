@@ -1,0 +1,68 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS  Section 06 — Omnissa DEM Profile Management
+.NOTES
+    Log : C:\VDI_GPO_Logs\06_DEM_ProfileManagement.log
+    Most DEM configuration is in the DEM Console, not registry.
+    This script handles: FlexEngine service, FSLogix Profile Container disable,
+    and registry settings that support the DEM + FSLogix ODFC coexistence.
+    Run As : Local Administrator / SYSTEM during image build
+#>
+
+. "$PSScriptRoot\Shared_Helpers.ps1"
+Confirm-Prerequisites
+Initialize-Log "06_DEM_ProfileManagement"
+
+$errors = 0; $warns = 0; $skipped = 0
+
+Write-Log "=== Configuring DEM Profile Management support settings ===" "INFO"
+
+# ── 1. Ensure FlexEngine service is set to Automatic ──────────────────────────
+Write-Log "--- 1. Ensure FlexEngine service is configured to Automatic start" "INFO"
+$svcName = "FlexEngine"
+$svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+if ($svc) {
+    if (-not (Set-ServiceConfig -Name $svcName -StartupType Automatic)) { $errors++ }
+    Write-Log "FlexEngine service found and configured." "SUCCESS"
+} else {
+    Write-Log "FlexEngine service NOT found. Ensure DEM Agent is installed on the golden image." "WARN"
+    $warns++
+}
+
+# ── 2. Disable FSLogix Profile Container (DEM owns profile) ───────────────────
+Write-Log "--- 2. Explicitly disable FSLogix Profile Container (DEM owns profile)" "INFO"
+Write-Log "    ODFC (Office Container) remains enabled — see Section 05." "INFO"
+if (-not (Set-RegValue -Hive HKLM `
+    -Path "SOFTWARE\FSLogix\Profiles" `
+    -Name "Enabled" -Value 0)) { $errors++ }
+
+# ── 3. Disable Windows native Folder Redirection (DEM manages this) ───────────
+Write-Log "--- 3. Disable Windows native folder redirection policy interference" "INFO"
+# Ensure no native GPO folder redirection keys are set that would conflict with DEM
+$frPaths = @(
+    "SOFTWARE\Policies\Microsoft\Windows\System",
+)
+# Note: folder redirection is configured in DEM console, not here.
+Write-Log "NOTE: Configure folder redirection exclusively in DEM Console." "INFO"
+Write-Log "      Do NOT enable OneDrive KFM for the same folders DEM redirects." "WARN"
+$warns++
+
+# ── 4. Themes service — MUST remain running for DEM desktop personalization ────
+Write-Log "--- 4. Ensure Themes service is Automatic (required for DEM wallpaper)" "INFO"
+if (-not (Set-ServiceConfig -Name "Themes" -StartupType Automatic)) { $warns++ }
+try {
+    Start-Service -Name "Themes" -ErrorAction Stop
+    Write-Log "Themes service started." "SUCCESS"
+} catch {
+    Write-Log "Themes service could not be started: $_" "WARN"; $warns++
+}
+
+# ── 5. NLA service — required before DEM can connect to config share ──────────
+Write-Log "--- 5. Ensure NLA (NlaSvc) is Automatic — required for DEM logon" "INFO"
+if (-not (Set-ServiceConfig -Name "NlaSvc" -StartupType Automatic)) { $errors++ }
+
+Write-Log "=== Section 06 complete ===" "INFO"
+Write-Log "REMINDER: Configure DEM FlexEngine config share, action sets, and exclusions in the DEM Console." "WARN"
+Write-Log "REMINDER: Exclude Outlook/Teams/OneDrive paths from DEM capture (they are in FSLogix ODFC)." "WARN"
+Write-Log "REMINDER: Do not enable OneDrive KFM and DEM folder redirection for the same paths." "WARN"
+Close-Log -Errors $errors -Warnings $warns -Skipped $skipped

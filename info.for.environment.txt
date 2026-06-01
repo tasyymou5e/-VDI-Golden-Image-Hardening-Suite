@@ -1,0 +1,31 @@
+PLACEHOLDERS TO UPDATE (Update these directly in the scripts)
+
+File: 03_Microsoft_Teams.ps1.txt
+Item: YOUR-TENANT-GUID-HERE
+Action: Replace with your organization's Azure AD / Entra ID Tenant GUID.
+
+File: 05_FSLogix_OfficeContainer.ps1.txt
+Item: \\YOUR-SERVER\FSLogix-ODFC
+Action: Replace with the active SMB UNC path for your FSLogix containers.
+
+File: 15_Services.ps1.txt
+Item: $disableWindowsSearch and $disablePrintSpooler
+Action: Set variables to $true or $false based on whether users need search indexing and printing.
+
+--------------------------------------------------------------------------------
+
+ENVIRONMENTAL PREREQUISITES (Verify these in your environment or on the base image)
+
+Infrastructure / Storage
+Action: Ensure proper NTFS and Share permissions are configured on the FSLogix ODFC network share.
+
+Base Image (Smart Card / CAC)
+Action: Pre-install required DoD root and intermediate certificates on the golden image.
+Action: Pre-install approved smart card middleware (e.g., ActivClient).
+
+Infrastructure (Horizon True SSO)
+Action: Verify VMware Horizon True SSO infrastructure (Enrollment Servers, CA) is operational for seamless CAC login.
+
+Infrastructure / DEM
+Action: Configure folder redirection in the DEM console (NOT via GPO).
+Action: Ensure DEM folder redirection does not conflict with OneDrive Known Folder Move (KFM).

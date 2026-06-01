@@ -1,0 +1,83 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS  Section 15 — Services to Disable on Golden Image
+.NOTES
+    Log : C:\VDI_GPO_Logs\15_Services.log
+    Disables unnecessary services that waste memory/CPU or create
+    network noise in non-persistent VDI.
+    IMPORTANT: Themes service MUST remain running (DEM dependency).
+    Windows Search: Conditional — leave enabled if OneDrive search integration needed.
+    Run As : Local Administrator / SYSTEM during image build
+#>
+
+. "$PSScriptRoot\Shared_Helpers.ps1"
+Confirm-Prerequisites
+Initialize-Log "15_Services"
+
+$errors = 0; $warns = 0; $skipped = 0
+
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
+$disableWindowsSearch = $false  # Set $true only if OneDrive/M365 search handles all search needs
+$disablePrintSpooler  = $false  # Set $true only if Horizon Virtual Printing is NOT used
+# ──────────────────────────────────────────────────────────────────────────────
+
+Write-Log "=== Configuring VDI service states ===" "INFO"
+
+# ── SERVICES TO DISABLE ───────────────────────────────────────────────────────
+$disable = @(
+    @{ Name="SysMain";           Display="SysMain (Superfetch)" },
+    @{ Name="XblAuthManager";    Display="Xbox Live Auth Manager" },
+    @{ Name="XblGameSave";       Display="Xbox Live Game Save" },
+    @{ Name="XboxNetApiSvc";     Display="Xbox Live Networking Service" },
+    @{ Name="XboxGipSvc";        Display="Xbox Accessory Management Service" },
+    @{ Name="WMPNetworkSvc";     Display="Windows Media Player Network Sharing" },
+    @{ Name="RemoteRegistry";    Display="Remote Registry" },
+    @{ Name="DiagTrack";         Display="Connected User Experiences and Telemetry" },
+    @{ Name="RetailDemo";        Display="Retail Demo Service" },
+    @{ Name="WerSvc";            Display="Windows Error Reporting Service" },
+    @{ Name="MapsBroker";        Display="Downloaded Maps Manager" },
+    @{ Name="lfsvc";             Display="Geolocation Service" },
+)
+
+foreach ($svc in $disable) {
+    Write-Log "--- Disabling: $($svc.Display)" "INFO"
+    if (-not (Set-ServiceConfig -Name $svc.Name -StartupType Disabled -StopNow $true)) { $warns++ }
+}
+
+# ── CONDITIONAL: Windows Search ───────────────────────────────────────────────
+Write-Log "--- Windows Search (WSearch) — conditional" "INFO"
+if ($disableWindowsSearch) {
+    Write-Log "Disabling Windows Search / Indexing (disableWindowsSearch = true)" "INFO"
+    if (-not (Set-ServiceConfig -Name "WSearch" -StartupType Disabled -StopNow $true)) { $warns++ }
+} else {
+    Write-Log "SKIP: Windows Search left enabled (OneDrive integration may use it). Set disableWindowsSearch=true to disable." "SKIP"
+    $skipped++
+}
+
+# ── CONDITIONAL: Print Spooler ────────────────────────────────────────────────
+Write-Log "--- Print Spooler (Spooler) — conditional" "INFO"
+if ($disablePrintSpooler) {
+    Write-Log "Disabling Print Spooler (disablePrintSpooler = true)" "INFO"
+    if (-not (Set-ServiceConfig -Name "Spooler" -StartupType Disabled -StopNow $true)) { $warns++ }
+} else {
+    Write-Log "SKIP: Print Spooler left enabled (Horizon Virtual Printing requires it). Set disablePrintSpooler=true if no printing." "SKIP"
+    $skipped++
+}
+
+# ── SERVICES THAT MUST REMAIN RUNNING ─────────────────────────────────────────
+Write-Log "--- Ensuring critical services remain enabled:" "INFO"
+$mustRun = @(
+    @{ Name="Themes";   Display="Themes (required for DEM desktop personalization)" },
+    @{ Name="NlaSvc";   Display="Network Location Awareness (required for domain GPO/DEM)" },
+    @{ Name="Netlogon"; Display="Net Logon (required for domain authentication)" },
+    @{ Name="Dnscache"; Display="DNS Client" },
+)
+foreach ($svc in $mustRun) {
+    Write-Log "Ensuring ENABLED: $($svc.Display)" "INFO"
+    if (-not (Set-ServiceConfig -Name $svc.Name -StartupType Automatic)) { $warns++ }
+    try { Start-Service -Name $svc.Name -ErrorAction Stop; Write-Log "$($svc.Name) running." "SUCCESS" }
+    catch { Write-Log "$($svc.Name) start: $_" "INFO" }
+}
+
+Write-Log "=== Section 15 complete ===" "INFO"
+Close-Log -Errors $errors -Warnings $warns -Skipped $skipped

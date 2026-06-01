@@ -1,0 +1,203 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS  Master Runner — Omnissa Horizon VDI Golden Image GPO Deployment
+.DESCRIPTION
+    Executes all 16 section scripts in sequence.
+    Each section writes its own log to C:\VDI_GPO_Logs\<SectionName>.log.
+    A master summary log is written to C:\VDI_GPO_Logs\00_Master_RunAll.log.
+
+    Stack  : Omnissa Horizon 8 | Windows 11 24H2 | Non-Persistent
+             DEM Profiles | FSLogix ODFC | Teams (Machine-Wide) | OneDrive for Business
+
+    Usage  : .\00_Master_RunAll.ps1
+             .\00_Master_RunAll.ps1 -SectionsToRun @(1,2,3)   # Run specific sections only
+             .\00_Master_RunAll.ps1 -DryRun                    # Log what would run, no changes
+
+    Run As : Local Administrator (Run as SYSTEM during image build via MDT/SCCM/Packer)
+.PARAMETER SectionsToRun
+    Array of section numbers to run (1-16). Default: all sections.
+.PARAMETER DryRun
+    Log script execution plan without making any changes.
+.PARAMETER LogDir
+    Override the log directory. Default: C:\VDI_GPO_Logs
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [int[]]$SectionsToRun = @(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17),
+    [switch]$DryRun,
+    [string]$LogDir = "C:\VDI_GPO_Logs"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Continue"
+
+# ── Validate prerequisites ─────────────────────────────────────────────────────
+$id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$pr = New-Object System.Security.Principal.WindowsPrincipal($id)
+if (-not $pr.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "ERROR: This script must be run as Administrator or SYSTEM." -ForegroundColor Red
+    exit 1
+}
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Host "ERROR: PowerShell 7.0 or higher required. Current: $($PSVersionTable.PSVersion)" -ForegroundColor Red
+    exit 1
+}
+
+# ── Setup master log ───────────────────────────────────────────────────────────
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+$masterLog  = Join-Path $LogDir "00_Master_RunAll.log"
+$scriptRoot = $PSScriptRoot
+
+function Write-Master {
+    param([string]$Msg, [string]$Color = "White")
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Msg"
+    Add-Content -Path $masterLog -Value $entry
+    Write-Host $entry -ForegroundColor $Color
+}
+
+# ── Section registry ───────────────────────────────────────────────────────────
+$allSections = @(
+    @{ Num=1;  Name="First-Run & Welcome Suppression";     File="01_FirstRun_WelcomeSuppression.ps1";  Critical=$true  },
+    @{ Num=2;  Name="Logon Speed & Animation";             File="02_Logon_Speed_Animation.ps1";        Critical=$true  },
+    @{ Num=3;  Name="Microsoft Teams";                     File="03_Microsoft_Teams.ps1";              Critical=$true  },
+    @{ Num=4;  Name="OneDrive for Business";               File="04_OneDrive_ForBusiness.ps1";         Critical=$true  },
+    @{ Num=5;  Name="FSLogix Office Container";            File="05_FSLogix_OfficeContainer.ps1";      Critical=$true  },
+    @{ Num=6;  Name="DEM Profile Management";              File="06_DEM_ProfileManagement.ps1";        Critical=$true  },
+    @{ Num=7;  Name="Start Menu & Taskbar";                File="07_StartMenu_Taskbar.ps1";            Critical=$false },
+    @{ Num=8;  Name="Search, Cortana & AI Features";       File="08_Search_Cortana_AI.ps1";            Critical=$true  },
+    @{ Num=9;  Name="Privacy & Telemetry";                 File="09_Privacy_Telemetry.ps1";            Critical=$false },
+    @{ Num=10; Name="Notifications & Action Center";       File="10_Notifications_ActionCenter.ps1";   Critical=$false },
+    @{ Num=11; Name="Windows Update & Patching";           File="11_WindowsUpdate_Patching.ps1";       Critical=$true  },
+    @{ Num=12; Name="Security & Defender Tuning";          File="12_Security_Defender.ps1";            Critical=$true  },
+    @{ Num=13; Name="Horizon-Specific Settings";           File="13_Horizon_Specific.ps1";             Critical=$true  },
+    @{ Num=14; Name="Power & Performance";                 File="14_Power_Performance.ps1";            Critical=$true  },
+    @{ Num=15; Name="Services to Disable";                 File="15_Services.ps1";                     Critical=$false },
+    @{ Num=16; Name="Network & Offline Files";             File="16_Network_OfflineFiles.ps1";         Critical=$false },
+    @{ Num=17; Name="Smart Card / CAC Seamless Login";     File="17_SmartCard_CAC_Login.ps1";          Critical=$true  }
+)
+
+# ── Pre-flight check ───────────────────────────────────────────────────────────
+$banner = @"
+================================================================================
+  VDI GOLDEN IMAGE — MASTER GPO DEPLOYMENT RUNNER
+  Stack  : Omnissa Horizon 8 / Windows 11 24H2 / Non-Persistent
+           DEM Profiles / FSLogix ODFC / Teams (Machine) / OneDrive (All Users)
+  Host   : $($env:COMPUTERNAME)
+  User   : $($env:USERNAME)
+  PS     : $($PSVersionTable.PSVersion)
+  Start  : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+  Mode   : $(if ($DryRun) {'DRY RUN — no changes will be made'} else {'LIVE — changes will be applied'})
+  LogDir : $LogDir
+================================================================================
+"@
+Write-Master $banner "Cyan"
+
+$missing = @()
+foreach ($sec in $allSections | Where-Object { $_.Num -in $SectionsToRun }) {
+    $fullPath = Join-Path $scriptRoot $sec.File
+    if (-not (Test-Path $fullPath)) { $missing += $sec.File }
+}
+if ($missing.Count -gt 0) {
+    Write-Master "ERROR: Missing script files:" "Red"
+    $missing | ForEach-Object { Write-Master "  - $_" "Red" }
+    Write-Master "Ensure all section scripts are in the same directory as this runner." "Red"
+    exit 1
+}
+Write-Master "Pre-flight: All $($allSections.Count) section scripts found." "Green"
+
+# ── Execute sections ───────────────────────────────────────────────────────────
+$results   = @()
+$totalFail = 0
+
+foreach ($sec in $allSections | Where-Object { $_.Num -in $SectionsToRun }) {
+    $secLabel = "Section $("{0:D2}" -f $sec.Num): $($sec.Name)"
+    Write-Master "" "White"
+    Write-Master ">>> Running $secLabel" "Cyan"
+
+    $fullPath = Join-Path $scriptRoot $sec.File
+    $started  = Get-Date
+    $status   = "OK"
+    $exitCode = 0
+
+    if ($DryRun) {
+        Write-Master "    [DRY RUN] Would execute: $fullPath" "Yellow"
+        $status = "DRY-RUN"
+    } else {
+        try {
+            & pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $fullPath
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0) {
+                $status = "FAILED (exit $exitCode)"
+                if ($sec.Critical) { $totalFail++ }
+            }
+        } catch {
+            $status   = "EXCEPTION: $_"
+            $exitCode = -1
+            if ($sec.Critical) { $totalFail++ }
+        }
+    }
+
+    $elapsed = (Get-Date) - $started
+    $result  = [PSCustomObject]@{
+        Section  = $secLabel
+        Script   = $sec.File
+        Status   = $status
+        Critical = $sec.Critical
+        Duration = "$([math]::Round($elapsed.TotalSeconds, 1))s"
+        Log      = Join-Path $LogDir ($sec.File -replace '\.ps1$', '.log')
+    }
+    $results += $result
+
+    $color = if ($status -eq "OK" -or $status -eq "DRY-RUN") { "Green" } else { "Red" }
+    Write-Master "    Status: $status  |  Duration: $($result.Duration)" $color
+}
+
+# ── Summary ────────────────────────────────────────────────────────────────────
+$summary = @"
+
+================================================================================
+  DEPLOYMENT SUMMARY
+  Completed : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+  Sections  : $($results.Count) run
+  Failures  : $totalFail (critical sections only)
+  Log Dir   : $LogDir
+================================================================================
+
+SECTION RESULTS:
+"@
+Write-Master $summary "Cyan"
+
+foreach ($r in $results) {
+    $flag  = if ($r.Critical) { "[CRITICAL]" } else { "[optional]" }
+    $color = if ($r.Status -eq "OK" -or $r.Status -eq "DRY-RUN") { "Green" } else { "Red" }
+    Write-Master ("  {0,-8} {1} {2,-50}  {3}" -f $r.Status, $flag, $r.Section, $r.Duration) $color
+}
+
+Write-Master "" "White"
+Write-Master "Individual log files: $LogDir\<section>.log" "White"
+Write-Master "Master log          : $masterLog" "White"
+
+# ── Force Group Policy refresh ─────────────────────────────────────────────────
+if (-not $DryRun) {
+    Write-Master "" "White"
+    Write-Master ">>> Running gpupdate /force to flush any conflicting cached policies..." "Cyan"
+    try {
+        $gpResult = & gpupdate /force 2>&1
+        Write-Master "    gpupdate complete." "Green"
+        Add-Content -Path $masterLog -Value ($gpResult -join "`n")
+    } catch {
+        Write-Master "    gpupdate failed (non-fatal): $_" "Yellow"
+    }
+}
+
+if ($totalFail -gt 0) {
+    Write-Master "" "White"
+    Write-Master "WARNING: $totalFail critical section(s) reported failures." "Red"
+    Write-Master "Review individual log files before sealing golden image." "Red"
+    exit 1
+} else {
+    Write-Master "" "White"
+    Write-Master "All sections completed. Run IMAGE.COMPLIANCE\RUN_AUDIT.ps1 next, then seal the golden image." "Green"
+    exit 0
+}
